@@ -1,45 +1,42 @@
-/// We derive Deserialize/Serialize so we can persist app state on shutdown.
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(default)] // if we add new fields, give them default values when deserializing old state
-pub struct TemplateApp {
+use std::sync::Arc;
+
+use egui::{Color32, ColorImage, ImageData, TextureHandle, TextureOptions};
+use image::{self, ImageBuffer, Rgb};
+pub struct WebCamApp {
     // Example stuff:
-    label: String,
+    screen_texture: TextureHandle,
 
-    #[serde(skip)] // This how you opt-out of serialization of a field
-    value: f32,
 }
 
-impl Default for TemplateApp {
-    fn default() -> Self {
-        Self {
-            // Example stuff:
-            label: "Hello World!".to_owned(),
-            value: 2.7,
-        }
-    }
-}
 
-impl TemplateApp {
+impl WebCamApp {
     /// Called once before the first frame.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // This is also where you can customize the look and feel of egui using
-        // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
+       
+       let screen_texture = cc.egui_ctx.load_texture(
+        "webcam",
+        ImageData::Color(Arc::new(ColorImage::new([1280,720], Color32::TRANSPARENT))),
+    TextureOptions::default(),
+    );
+    Self { screen_texture: screen_texture }
+    }
 
-        // Load previous app state (if any).
-        // Note that you must enable the `persistence` feature for this to work.
-        if let Some(storage) = cc.storage {
-            return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+    pub fn capture_frame(&self) -> ImageBuffer<Rgb<u8>, Vec<u8>>{
+        let mut img = image::RgbImage::new(1280, 720);
+        for x in 15..=17 {
+            for y in 8..24 {
+                img.put_pixel(x, y, image::Rgb([255, 0, 0]));
+                img.put_pixel(y, x, image::Rgb([255, 0, 0]));
+            }
         }
+        img
 
-        Default::default()
     }
 }
 
-impl eframe::App for TemplateApp {
+impl eframe::App for WebCamApp {
     /// Called by the frame work to save state before shutdown.
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, self);
-    }
+
 
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -66,44 +63,28 @@ impl eframe::App for TemplateApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::both().show(ui, |ui|{ 
             // The central panel the region left after adding TopPanel's and SidePanel's
-            ui.heading("eframe template");
+            ui.heading("SAM_CAM_BAM");
+                
 
             ui.horizontal(|ui| {
-                ui.label("Write something: ");
-                ui.text_edit_singleline(&mut self.label);
-            });
-
-            ui.add(egui::Slider::new(&mut self.value, 0.0..=10.0).text("value"));
-            if ui.button("Increment").clicked() {
-                self.value += 1.0;
-            }
-
-            ui.separator();
-
-            ui.add(egui::github_link_file!(
-                "https://github.com/emilk/eframe_template/blob/main/",
-                "Source code."
-            ));
-
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                powered_by_egui_and_eframe(ui);
-                egui::warn_if_debug_build(ui);
+                ui.add(
+                egui::Image::new(&self.screen_texture)
+                    .max_height(1920.0)
+                    .max_width(1080.0)
+                    .rounding(10.0),
+                );
             });
         });
-    }
+        if ui.button("take a pic").clicked(){
+            let img = self.capture_frame();
+            self.screen_texture.set(
+                ColorImage::from_rgb([1280, 720], &img.into_raw()),
+                TextureOptions::default(),
+            );
+        };
+        });
+        
 }
-
-fn powered_by_egui_and_eframe(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.label("Powered by ");
-        ui.hyperlink_to("egui", "https://github.com/emilk/egui");
-        ui.label(" and ");
-        ui.hyperlink_to(
-            "eframe",
-            "https://github.com/emilk/egui/tree/master/crates/eframe",
-        );
-        ui.label(".");
-    });
 }
