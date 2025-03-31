@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4cb8cc9..6d15960 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -371,7 +371,7 @@ mod internal {
+             kCMPixelFormat_8IndexedGray_WhiteIsZero => Some(FrameFormat::GRAY),
+             kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+             | kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+-            | 875704438 => Some(FrameFormat::NV12),
++            | 875704438 => Some(FrameFormat::YUYV),
+             kCMPixelFormat_24RGB => Some(FrameFormat::RAWRGB),
+             _ => None,
+         }

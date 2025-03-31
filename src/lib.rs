@@ -2,4 +2,4 @@
 
 mod app;
 pub use app::WebCamApp;
-use image;
+use nokhwa;

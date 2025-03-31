@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::{ptr::NonNull, sync::Arc};
 
 use egui::{Color32, ColorImage, ImageData, TextureHandle, TextureOptions};
 use image::{self, ImageBuffer, Rgb};
+use nokhwa::{pixel_format::RgbFormat, utils::{CameraIndex, RequestedFormat, RequestedFormatType}, Camera};
 pub struct WebCamApp {
     // Example stuff:
     screen_texture: TextureHandle,
+    camera: Camera,
 
 }
 
@@ -13,23 +15,38 @@ impl WebCamApp {
     /// Called once before the first frame.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
        
-       let screen_texture = cc.egui_ctx.load_texture(
+    let screen_texture = cc.egui_ctx.load_texture(
         "webcam",
         ImageData::Color(Arc::new(ColorImage::new([1280,720], Color32::TRANSPARENT))),
-    TextureOptions::default(),
-    );
-    Self { screen_texture: screen_texture }
+        TextureOptions::default(),
+        );
+
+    //nokhwa::nokhwa_initialize(|work|println!("umm {work}"));
+    // first camera in system
+    let index = CameraIndex::Index(0); 
+    // request the absolute highest resolution CameraFormat that can be decoded to RGB.
+    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
+    // make the camera
+    let mut camera = Camera::new(index, requested).unwrap();
+    camera.open_stream().unwrap();
+        
+    Self { screen_texture: screen_texture, camera }
     }
 
-    pub fn capture_frame(&self) -> ImageBuffer<Rgb<u8>, Vec<u8>>{
-        let mut img = image::RgbImage::new(1280, 720);
-        for x in 15..=17 {
-            for y in 8..24 {
-                img.put_pixel(x, y, image::Rgb([255, 0, 0]));
-                img.put_pixel(y, x, image::Rgb([255, 0, 0]));
-            }
-        }
-        img
+    pub fn capture_frame(&mut self) -> ImageBuffer<Rgb<u8>, Vec<u8>>{
+        // get a frame
+        let frame = self.camera.frame().unwrap();
+        println!("Captured Single Frame of {}", frame.buffer().len());
+        println!("Resolution {} ", frame.resolution());
+        // decode into an ImageBuffer
+        let decoded = frame.decode_image::<RgbFormat>();
+
+        let img = match decoded {
+            Ok(img)=> img,
+            Err(e) => panic!("cant decode the image, {e} ")
+        };
+        println!("height is {} and width is{}",img.height(),img.width());
+        return img
 
     }
 }
@@ -80,7 +97,7 @@ impl eframe::App for WebCamApp {
         if ui.button("take a pic").clicked(){
             let img = self.capture_frame();
             self.screen_texture.set(
-                ColorImage::from_rgb([1280, 720], &img.into_raw()),
+                ColorImage::from_rgb([1920, 1080], &img.into_raw()),
                 TextureOptions::default(),
             );
         };
