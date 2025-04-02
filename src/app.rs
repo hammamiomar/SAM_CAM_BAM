@@ -5,16 +5,17 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
+    // --- Add time types ---
+    time::{Duration, Instant},
 };
 
-use egui::{ColorImage, ImageData, TextureHandle, TextureOptions, Vec2};
+use egui::{ColorImage, ImageData, TextureHandle, TextureOptions, Vec2, Align, Layout}; // Added Align, Layout
 use log::{debug, error, info, warn};
 use nokhwa::{
-    // --- FIX 1: Correct import name ---
-    pixel_format::{RgbFormat, YuyvFormat}, // Use YuyvFormat
+    pixel_format::{RgbFormat, YuyvFormat},
     utils::{
         ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-        Resolution, // Need Resolution struct
+        Resolution,
     },
     Camera, NokhwaError,
 };
@@ -23,10 +24,13 @@ use nokhwa::{
 const REQUESTED_WIDTH: u32 = 1280;
 const REQUESTED_HEIGHT: u32 = 720;
 const REQUESTED_FPS: u32 = 30;
+// --- How often to update the FPS counter (e.g., every 500ms) ---
+const FPS_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+
 
 // --- Message from Camera Thread to UI Thread ---
 enum CameraThreadMsg {
-    Frame(Arc<ColorImage>), // Send decoded RGB image
+    Frame(Arc<ColorImage>),
     Error(String),
 }
 
@@ -39,20 +43,22 @@ pub struct WebCamApp {
     camera_error: Option<String>,
     camera_resolution: Option<Resolution>,
     texture_size: Option<Vec2>,
+
+    // --- Fields for FPS calculation ---
+    last_fps_update_time: Instant,
+    frames_since_last_update: u32,
+    last_calculated_fps: f32,
 }
 
 impl WebCamApp {
     /// Called once before the first frame.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let camera_index = CameraIndex::Index(0);
-
         let texture = None;
-
         let (camera_thread_tx, camera_thread_rx) = mpsc::channel();
         let stop_signal = Arc::new(AtomicBool::new(false));
         let stop_signal_clone = stop_signal.clone();
         let egui_ctx = cc.egui_ctx.clone();
-
         let thread_index = camera_index.clone();
 
         let camera_thread_handle = Some(thread::spawn(move || {
@@ -72,11 +78,33 @@ impl WebCamApp {
             camera_error: None,
             camera_resolution: None,
             texture_size: None,
+            // --- Initialize FPS fields ---
+            last_fps_update_time: Instant::now(),
+            frames_since_last_update: 0,
+            last_calculated_fps: 0.0,
+        }
+    }
+
+    /// Calculates and updates the FPS counter.
+    fn update_fps_counter(&mut self) {
+        self.frames_since_last_update += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_fps_update_time);
+
+        if elapsed >= FPS_UPDATE_INTERVAL {
+            let elapsed_secs = elapsed.as_secs_f32();
+            self.last_calculated_fps = if elapsed_secs > 0.0 {
+                self.frames_since_last_update as f32 / elapsed_secs
+            } else {
+                f32::INFINITY // Avoid division by zero if interval is tiny
+            };
+            self.frames_since_last_update = 0;
+            self.last_fps_update_time = now;
         }
     }
 }
 
-// --- Camera Capture Thread Logic ---
+// --- Camera Capture Thread Logic (remains the same as before) ---
 fn camera_capture_thread(
     index: CameraIndex,
     msg_sender: Sender<CameraThreadMsg>,
@@ -84,38 +112,30 @@ fn camera_capture_thread(
     ctx: egui::Context,
 ) {
     info!("Camera capture thread started. Requesting YUYV format.");
-
-    // --- Define the Requested Format ---
-    // --- FIX 2: Create Resolution struct first ---
     let requested_resolution = Resolution::new(REQUESTED_WIDTH, REQUESTED_HEIGHT);
     let requested_cam_format = CameraFormat::new(
-        requested_resolution, // Pass Resolution struct
+        requested_resolution,
         FrameFormat::YUYV,
         REQUESTED_FPS,
     );
-    // --- Use YuyvFormat pixel type ---
     let requested_format = RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(
         requested_cam_format,
     ));
     info!("Requested camera format: {:?}", requested_format);
 
-    // --- Initialize Camera *inside* the thread ---
-    // Try default backend first
     let camera_result = Camera::new(index.clone(), requested_format.clone())
         .or_else(|err| {
             warn!(
                 "Default backend failed: {}. Trying AVFoundation explicitly...",
                 err
             );
-            // --- FIX 3: Use Camera::with_backend ---
             Camera::with_backend(
-                index, // Use original index here
-                requested_format, // Pass the requested format
-                ApiBackend::AVFoundation, // Explicitly specify backend
+                index,
+                requested_format,
+                ApiBackend::AVFoundation,
             )
         });
 
-    // --- Handle Camera Initialization Result ---
     let mut camera = match camera_result {
         Ok(cam) => {
             info!("Camera initialized successfully.");
@@ -131,12 +151,10 @@ fn camera_capture_thread(
         }
     };
 
-    // --- Get Actual Camera Format ---
     let camera_format = camera.camera_format();
     let actual_resolution = camera_format.resolution();
     info!("Actual camera format received: {:?}", camera_format);
 
-    // --- Open Camera Stream ---
     if let Err(err) = camera.open_stream() {
         let error_msg = format!("Failed to open camera stream: {}", err);
         error!("{}", error_msg);
@@ -146,12 +164,10 @@ fn camera_capture_thread(
     }
     info!("Camera stream opened successfully.");
 
-    // --- Frame Capture Loop ---
     while !stop_signal.load(Ordering::Relaxed) {
         match camera.frame() {
             Ok(frame) => {
-                // Frame buffer here is likely YUYV
-                match frame.decode_image::<RgbFormat>() { // Decode to RGB
+                match frame.decode_image::<RgbFormat>() {
                     Ok(decoded_rgb_image) => {
                         let resolution = [
                             decoded_rgb_image.width() as usize,
@@ -196,8 +212,6 @@ fn camera_capture_thread(
             }
         }
     }
-
-    // --- Cleanup ---
     info!("Camera capture thread stopping signal received.");
     if let Err(e) = camera.stop_stream() {
         error!("Failed to stop camera stream cleanly: {}", e);
@@ -205,15 +219,20 @@ fn camera_capture_thread(
     info!("Camera capture thread finished.");
 }
 
+
 // --- eframe App Implementation ---
 impl eframe::App for WebCamApp {
     /// Called each time the UI needs repainting
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.camera_error = None;
+        // --- Update FPS counter at the start of the frame ---
+        self.update_fps_counter();
 
+        self.camera_error = None; // Clear previous error each frame
+
+        // --- Process messages from camera thread (remains the same) ---
         loop {
             match self.camera_thread_rx.try_recv() {
-                Ok(msg) => match msg {
+                 Ok(msg) => match msg {
                     CameraThreadMsg::Frame(frame_arc) => {
                         let size = frame_arc.size;
                         let frame_size_vec = Vec2::new(size[0] as f32, size[1] as f32);
@@ -266,6 +285,8 @@ impl eframe::App for WebCamApp {
         }
 
         // --- Define the UI ---
+
+        // --- Top Panel (Menu Bar) ---
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 let is_web = cfg!(target_arch = "wasm32");
@@ -281,6 +302,25 @@ impl eframe::App for WebCamApp {
             });
         });
 
+        // --- Bottom Panel (FPS Counter) ---
+        egui::TopBottomPanel::bottom("bottom_panel")
+            .resizable(false) // Optional: prevent resizing
+            .show(ctx, |ui| {
+                // Align FPS counter to the right
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                     ui.label(format!("UI FPS: {:.1}", self.last_calculated_fps));
+                     // Add a little space
+                     ui.add_space(10.0);
+                     // Add resolution info here as well if desired
+                     if let Some(res) = self.camera_resolution {
+                         ui.label(format!("Cam Res: {}x{}", res.width(), res.height()));
+                     } else if self.camera_error.is_none() {
+                         ui.label("Cam Res: ...");
+                     }
+                });
+            });
+
+        // --- Central Panel (Webcam Image) ---
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SAM_CAM_BAM Stream");
             ui.separator();
@@ -297,38 +337,46 @@ impl eframe::App for WebCamApp {
                         } else {
                             1.0
                         };
+                        // Fill available space, calculating height from width and aspect ratio
                         let available_width = ui.available_width();
-                        let image_height = available_width / aspect_ratio;
+                        let available_height = ui.available_height(); // Use remaining height
+                        let mut image_width = available_width;
+                        let mut image_height = available_width / aspect_ratio;
 
-                        ui.add(
-                            egui::Image::new(texture)
-                                .max_width(available_width)
-                                .max_height(image_height)
-                                .maintain_aspect_ratio(true)
-                                .rounding(5.0),
-                        );
+                        // If calculated height exceeds available, scale based on height instead
+                        if image_height > available_height {
+                            image_height = available_height;
+                            image_width = available_height * aspect_ratio;
+                        }
+
+
+                        // Center the image (optional)
+                        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                             ui.add(
+                                egui::Image::new(texture)
+                                    .max_width(image_width)
+                                    .max_height(image_height)
+                                    .maintain_aspect_ratio(true)
+                                    .rounding(5.0),
+                             );
+                        });
+
                     } else {
                         ui.label("Texture exists but size unknown.");
                     }
                 }
                 None if self.camera_error.is_none() => {
-                    ui.spinner();
-                    ui.label("Initializing camera stream...");
+                    // Center the loading indicator
+                     ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                        ui.add_space(ui.available_height() / 3.0); // Add some space above
+                        ui.spinner();
+                        ui.label("Initializing camera stream...");
+                    });
                 }
                 None => {} // Error message shown above
             }
 
-            ui.separator();
-
-            if let Some(res) = self.camera_resolution {
-                ui.label(format!(
-                    "Detected Camera Resolution: {}x{}",
-                    res.width(),
-                    res.height()
-                ));
-            } else if self.camera_error.is_none() {
-                ui.label("Camera Resolution: Waiting...");
-            }
+            // Removed resolution label from here, moved to bottom panel
         });
     }
 
