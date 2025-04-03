@@ -24,7 +24,10 @@ log = "0.4"
 # You only need serde if you want app persistence:
 serde = { version = "1", features = ["derive"] }
 image = "0.25.6"
-usls = { git = "https://github.com/jamjamjon/usls", branch = "main" }
+usls = { git = "https://github.com/jamjamjon/usls", branch = "main", features=["mps"] }
+ndarray = "0.16.1"
+imageproc = "0.25.0"
+crossbeam-channel = "0.5.14"
 
 [dependencies.nokhwa]
 version = "0.10.7"
