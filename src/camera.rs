@@ -2,14 +2,19 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
+        mpsc::TrySendError as StdTrySendError, // Keep std error for reference if needed
         Arc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::Duration, // Keep Duration
 };
-// *** CHANGED: Removed egui::ColorImage import ***
-use image::RgbImage; // Send RgbImage now
+
+// --- Use crossbeam_channel ---
+use crossbeam_channel::{Sender, SendError}; // Only need Sender and SendError here
+// --- End crossbeam_channel ---
+
+// Need RgbImage for the message type payload
+use image::RgbImage;
 use log::{error, info, warn};
 use nokhwa::{
     pixel_format::{RgbFormat, YuyvFormat},
@@ -20,6 +25,8 @@ use nokhwa::{
     Camera, NokhwaError,
 };
 
+// --- Constants specific to camera configuration ---
+// --- Using Lowered Resolution ---
 const REQUESTED_WIDTH: u32 = 640;
 const REQUESTED_HEIGHT: u32 = 480;
 const REQUESTED_FPS: u32 = 30;
@@ -27,15 +34,16 @@ const REQUESTED_FPS: u32 = 30;
 // --- Message from Camera Thread to Segmentation Thread ---
 #[derive(Debug)]
 pub enum CameraThreadMsg {
-    Frame(Arc<RgbImage>), // *** CHANGED: Send RgbImage ***
+    Frame(Arc<RgbImage>), // Send RgbImage
     Error(String),
 }
 
+// --- Public function signature uses crossbeam Sender ---
 pub fn start_camera_thread(
     index: CameraIndex,
-    msg_sender: Sender<CameraThreadMsg>,
+    msg_sender: Sender<CameraThreadMsg>, // crossbeam Sender
     stop_signal: Arc<AtomicBool>,
-    ctx: egui::Context, // Context still needed for repaint requests from *this* thread if errors occur
+    ctx: egui::Context, // Keep context for potential error reporting repaints
 ) -> JoinHandle<()> {
     info!("Spawning camera capture thread.");
     thread::spawn(move || {
@@ -43,13 +51,13 @@ pub fn start_camera_thread(
     })
 }
 
+// --- Internal loop logic uses crossbeam Sender ---
 fn camera_capture_loop(
     index: CameraIndex,
-    msg_sender: Sender<CameraThreadMsg>,
+    msg_sender: Sender<CameraThreadMsg>, // crossbeam Sender
     stop_signal: Arc<AtomicBool>,
-    ctx: egui::Context, // Keep ctx for error repaints
+    ctx: egui::Context, // For error repaints
 ) {
-    // --- Camera Initialization (remains the same) ---
     info!("Camera capture loop started. Requesting YUYV format.");
     let requested_resolution = Resolution::new(REQUESTED_WIDTH, REQUESTED_HEIGHT);
     let requested_cam_format = CameraFormat::new(
@@ -61,31 +69,33 @@ fn camera_capture_loop(
         requested_cam_format,
     ));
     info!("Requested camera format: {:?}", requested_format);
+
+    // --- Initialize Camera (remains the same) ---
     let camera_result = Camera::new(index.clone(), requested_format.clone())
         .or_else(|err| {
-            warn!(
-                "Default backend failed: {}. Trying AVFoundation explicitly...",
-                err
-            );
+            warn!("Default backend failed: {}. Trying AVFoundation explicitly...", err);
             Camera::with_backend(index, requested_format, ApiBackend::AVFoundation)
         });
+
     let mut camera = match camera_result {
         Ok(cam) => { info!("Camera initialized successfully."); cam }
-        Err(err) => { /* ... error handling sends msg, ctx.request_repaint(), returns ... */
+        Err(err) => {
             let error_msg = format!("Failed to open camera: {}", err);
             error!("{}", error_msg);
+            // Send error and request repaint *from this thread* for initialization errors
             let _ = msg_sender.send(CameraThreadMsg::Error(error_msg));
-            ctx.request_repaint(); // Repaint needed to show camera init error
+            ctx.request_repaint();
             return;
         }
     };
+
     let camera_format = camera.camera_format();
     info!("Actual camera format received: {:?}", camera_format);
-    if let Err(err) = camera.open_stream() { /* ... error handling sends msg, ctx.request_repaint(), returns ... */
+    if let Err(err) = camera.open_stream() {
         let error_msg = format!("Failed to open stream: {}", err);
         error!("{}", error_msg);
         let _ = msg_sender.send(CameraThreadMsg::Error(error_msg));
-        ctx.request_repaint(); // Repaint needed to show stream open error
+        ctx.request_repaint(); // Repaint needed for stream open error
         return;
     }
     info!("Camera stream opened successfully.");
@@ -96,24 +106,24 @@ fn camera_capture_loop(
             Ok(frame) => {
                 match frame.decode_image::<RgbFormat>() {
                     Ok(decoded_rgb_image) => {
-                        // decoded_rgb_image is already an RgbImage
-                        if msg_sender
-                            .send(CameraThreadMsg::Frame(Arc::new(decoded_rgb_image))) // Send Arc<RgbImage>
-                            .is_ok()
-                        {
-                            // No repaint request needed here, segmentation thread will do it
-                        } else {
+                        let frame_arc = Arc::new(decoded_rgb_image);
+                        // --- Use crossbeam blocking send (since channel is unbounded) ---
+                        // This will only fail if the receiver is disconnected.
+                        if let Err(SendError(_)) = msg_sender.send(CameraThreadMsg::Frame(frame_arc)) {
                             info!("Segmentation thread receiver disconnected. Stopping camera loop.");
-                            break;
+                            break; // Exit loop if receiver is gone
                         }
+                        // No need to request repaint on success, seg thread does that
                     }
-                    Err(err) => { /* ... error handling ... */
+                    Err(err) => {
                         warn!("Failed to decode frame to RGB: {}", err);
+                        // Consider sending error?
+                        // let _ = msg_sender.send(CameraThreadMsg::Error(format!("Decode Error: {}", err)));
                         thread::sleep(std::time::Duration::from_millis(50));
                     }
                 }
             }
-            Err(err) => { /* ... error handling, send msg, maybe ctx.request_repaint() on critical error ... */
+            Err(err) => {
                 match err {
                     NokhwaError::ReadFrameError(msg) if msg.contains("Timeout") => {
                         warn!("Camera frame read timeout.");
@@ -122,12 +132,12 @@ fn camera_capture_loop(
                     _ => {
                         let error_msg = format!("Failed to capture frame: {}", err);
                         error!("{}", error_msg);
-                        // Send error, segmentation thread might relay it or UI can handle CameraThreadMsg::Error
-                        if msg_sender.send(CameraThreadMsg::Error(error_msg)).is_err() {
+                        // Send critical capture errors
+                        if let Err(SendError(_)) = msg_sender.send(CameraThreadMsg::Error(error_msg)) {
                             info!("Segmentation thread receiver disconnected after capture error.");
                             break;
                         }
-                        // Maybe request repaint if capture totally fails?
+                        // Maybe request repaint for critical capture errors?
                         // ctx.request_repaint();
                         thread::sleep(std::time::Duration::from_secs(1));
                     }
