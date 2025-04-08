@@ -6,15 +6,18 @@ version = 3
 name = "SAM_CAM_BAM"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossbeam-channel",
  "eframe",
  "egui",
  "env_logger",
+ "fnv",
  "image 0.25.6",
  "imageproc",
  "log",
  "ndarray",
  "nokhwa",
+ "ort",
  "serde",
  "usls",
  "wasm-bindgen-futures",

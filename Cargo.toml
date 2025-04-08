@@ -28,6 +28,9 @@ usls = { git = "https://github.com/jamjamjon/usls", branch = "main", features=["
 ndarray = "0.16.1"
 imageproc = "0.25.0"
 crossbeam-channel = "0.5.14"
+anyhow = "1.0.97"
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["ndarray", "half", "load-dynamic", "coreml"] }
+fnv = "1.0"
 
 [dependencies.nokhwa]
 version = "0.10.7"
