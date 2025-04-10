@@ -31,6 +31,11 @@ crossbeam-channel = "0.5.14"
 anyhow = "1.0.97"
 ort = { version = "2.0.0-rc.9", default-features = false, features = ["ndarray", "half", "load-dynamic", "coreml"] }
 fnv = "1.0"
+rodio = "0.20.1"
+rustfft = "6.2.0"
+rfd = "0.15.3"
+
+
 
 [dependencies.nokhwa]
 version = "0.10.7"
