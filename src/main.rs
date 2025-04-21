@@ -7,6 +7,8 @@ mod camera;
 mod segmentation; // Ensure this is declared
 mod ui;
 mod music;
+mod live_audio;
+mod visuals;
 
 // When compiling natively:
 #[cfg(not(target_arch = "wasm32"))]

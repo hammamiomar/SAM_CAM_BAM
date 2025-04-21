@@ -5,7 +5,6 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 // --- Use crossbeam_channel ---
 use crossbeam_channel::{Sender, SendError};
@@ -66,7 +65,7 @@ fn camera_capture_loop(
     info!("Requested camera format: {:?}", requested_format);
 
     // --- Initialize Camera ---
-    let camera_result = Camera::new(index.clone(), requested_format.clone())
+    let camera_result = Camera::new(index.clone(), requested_format)
         .or_else(|err| {
             warn!("Default backend failed: {}. Trying AVFoundation explicitly...", err);
             Camera::with_backend(index, requested_format, ApiBackend::AVFoundation)
