@@ -28,6 +28,15 @@ usls = { git = "https://github.com/jamjamjon/usls", branch = "main", features=["
 ndarray = "0.16.1"
 imageproc = "0.25.0"
 crossbeam-channel = "0.5.14"
+anyhow = "1.0.97"
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["ndarray", "half", "load-dynamic", "coreml"] }
+fnv = "1.0"
+rustfft = "6.2.0"
+cpal = "0.15.3"
+rand = "0.9.1"
+palette = "0.7.6"
+
+
 
 [dependencies.nokhwa]
 version = "0.10.7"
@@ -55,6 +64,8 @@ opt-level = 2 # fast and small wasm
 # Optimize all dependencies even in debug builds:
 [profile.dev.package."*"]
 opt-level = 2
+
+[lints.rust]
 
 
 
