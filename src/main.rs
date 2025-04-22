@@ -1,16 +1,14 @@
 // src/main.rs
 #![warn(clippy::all, rust_2018_idioms)]
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// Declare the modules that main.rs will use
 mod camera;
-mod segmentation; // Ensure this is declared
+mod segmentation; 
 mod ui;
 mod music;
 mod live_audio;
 mod visuals;
 
-// When compiling natively:
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -24,14 +22,8 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "SAM_CAM_BAM Stream (EdgeSAM - Click)", // Updated title
+        "SAM_CAM_BAM", 
         native_options,
-        Box::new(|cc| Ok(Box::new(ui::WebcamAppUI::new(cc)))), // Use the struct from ui.rs
+        Box::new(|cc| Ok(Box::new(ui::WebcamAppUI::new(cc)))),
     )
-}
-
-// --- WASM main remains the same ---
-#[cfg(target_arch = "wasm32")]
-fn main() {
-     // ... (wasm setup as before, likely won't work correctly) ...
 }
