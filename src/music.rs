@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration; // For moving average normalization
 
-const FFT_SIZE: usize = 2048;
+const FFT_SIZE: usize = 512;
 const HOP_SIZE: usize = FFT_SIZE / 4;
 const SMOOTHING_FACTOR: f32 = 0.15;
 const NORM_WINDOW_SIZE: usize = 50; // Number of frames for moving max window

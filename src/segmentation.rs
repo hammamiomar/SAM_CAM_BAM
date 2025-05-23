@@ -4,7 +4,7 @@ use crossbeam_channel::{
 };
 use egui::ColorImage;
 use image::{DynamicImage, RgbImage};
-use imageproc::{rect::Rect};
+use imageproc::rect::Rect;
 use log::{debug, error, info, warn};
 use rand::rngs::SmallRng;
 use rand::Rng;
