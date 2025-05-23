@@ -1,14 +1,12 @@
 // src/visuals.rs
-use image::{ImageBuffer, Luma, Pixel, Rgb, RgbImage};
+use image::{ImageBuffer, Luma, Rgb, RgbImage}; 
 use imageproc::rect::Rect;
 use rand::Rng;
 use std::f32::consts::PI;
 
-// --- Constants ---
 const WHITE: Rgb<u8> = Rgb([255, 255, 255]);
 const BLACK: Rgb<u8> = Rgb([0, 0, 0]);
 
-// --- Helper: Lerp Color (Linear Interpolation) ---
 #[inline]
 fn lerp_color(c1: Rgb<u8>, c2: Rgb<u8>, t: f32) -> Rgb<u8> {
     let t = t.clamp(0.0, 1.0);
@@ -19,221 +17,196 @@ fn lerp_color(c1: Rgb<u8>, c2: Rgb<u8>, t: f32) -> Rgb<u8> {
     ])
 }
 
-// --- Helper: Check if inside mask ---
 #[inline]
 fn is_inside_mask(x: i32, y: i32, mask: &ImageBuffer<Luma<u8>, Vec<u8>>) -> bool {
+    if x < 0 || y < 0 {
+        return false;
+    }
     mask.get_pixel_checked(x as u32, y as u32)
         .map_or(false, |p| p[0] > 128)
 }
 
-// --- Bass Visualization ---
+#[inline]
+fn spatial_noise(x: f32, y: f32, seed: f32) -> f32 {
+    let val = (x * 12.9898 + y * 78.233 + seed * 123.456).sin() * 43758.5453;
+    val - val.floor()
+}
+
+// --- Bass Visualization - "Expanding Pulse / Heartbeat" 
 fn draw_bass_visuals(
     display_image: &mut RgbImage,
     mask_image: &ImageBuffer<Luma<u8>, Vec<u8>>,
     bbox_rect: Rect,
     intensity: f32,
-    _frame_count: u64, // Keep for potential future use
-    _animation_phase: f32, // Keep for potential future use
-    _rng: &mut impl Rng, // Keep for potential future use
+    frame_count: u64,
+    _animation_phase: f32,
+    _rng: &mut impl Rng,
 ) {
     let center_x = bbox_rect.left() + bbox_rect.width() as i32 / 2;
     let center_y = bbox_rect.top() + bbox_rect.height() as i32 / 2;
-    let max_dist = (bbox_rect.width().max(bbox_rect.height()) as f32 * 0.7) + 1.0; // Diagonal distance approx
+    let max_dim = (bbox_rect.width().max(bbox_rect.height())) as f32;
+    let color_low = Rgb([80, 0, 10]);
+    let color_high = lerp_color(Rgb([255, 0, 0]), Rgb([255, 100, 0]), intensity);
+    let pulse_speed = 0.02 + intensity * 0.05;
+    let phase = (frame_count as f32 * pulse_speed) % 1.0;
+    let ring_center_norm = phase;
+    let ring_thickness_norm = (0.1 + intensity * 0.2).clamp(0.01, 0.5); // Ensure non-zero thickness
+    let background_color = lerp_color(BLACK, color_low, intensity * 0.3);
 
-    // Palette: Deep Red -> Bright Red -> Orange -> Yellow
-    let color_near = lerp_color(Rgb([255, 60, 0]), Rgb([255, 200, 0]), intensity.powi(2)); // Orange/Yellow pulse
-    let color_far = lerp_color(Rgb([50, 0, 0]), Rgb([150, 0, 0]), intensity); // Dark to mid red
-
-    // 1. Radial Gradient Fill (pulsing brightness/color)
     for y in bbox_rect.top()..bbox_rect.bottom() {
         for x in bbox_rect.left()..bbox_rect.right() {
             if is_inside_mask(x, y, mask_image) {
-                let dx = (x - center_x) as f32;
-                let dy = (y - center_y) as f32;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let gradient_t = (dist / max_dist).powf(0.8); // Non-linear falloff
-                let base_viz_color = lerp_color(color_near, color_far, gradient_t);
-                display_image.put_pixel(x as u32, y as u32, base_viz_color);
+                let dx = x as f32 - center_x as f32;
+                let dy = y as f32 - center_y as f32;
+                let dist_from_center = (dx * dx + dy * dy).sqrt();
+                let dist_norm = dist_from_center / (max_dim * 0.5).max(1.0);
+                let dist_from_ring_center = (dist_norm - ring_center_norm).abs();
+                let ring_value = (1.0 - (dist_from_ring_center / ring_thickness_norm))
+                    .clamp(0.0, 1.0)
+                    .powi(2);
+                let final_color = lerp_color(background_color, color_high, ring_value);
+                display_image.put_pixel(x as u32, y as u32, final_color);
             }
-        }
-    }
-
-    // 2. Thick Waveform Line (drawn over gradient)
-    let wave_amplitude = bbox_rect.height() as f32 * 0.8 * intensity; // Thicker amplitude
-    let wave_frequency = PI * 2.0 / (bbox_rect.width() as f32 * 0.8); // One cycle across 80% width
-    let wave_phase = _animation_phase * 2.0; // Slow movement
-    let line_color = lerp_color(Rgb([255, 150, 50]), WHITE, intensity); // Orange/White line
-    let line_thickness = (1.0 + 4.0 * intensity) as i32; // Thickness from 1 to 5 pixels
-
-    let wave_base_y = center_y;
-    for x in bbox_rect.left()..bbox_rect.right() {
-        let y_offset = (wave_amplitude * (x as f32 * wave_frequency + wave_phase).sin()) as i32;
-        let y_center = wave_base_y + y_offset;
-
-        // Draw thick line vertically
-        for y_off in -line_thickness..=line_thickness {
-             let y = y_center + y_off;
-             // Simple anti-alias based on distance from center of thickness
-             let thickness_t = 1.0 - (y_off as f32 / line_thickness as f32).abs();
-             let current_line_color = lerp_color(BLACK, line_color, thickness_t.powi(2)); // Fade edge
-
-             if is_inside_mask(x, y, mask_image) {
-                 // Blend with the background gradient
-                 let existing_pixel = display_image.get_pixel(x as u32, y as u32);
-                 let final_color = lerp_color(*existing_pixel, current_line_color, 0.8 * thickness_t); // Blend 80% line color
-                 display_image.put_pixel(x as u32, y as u32, final_color);
-             }
         }
     }
 }
 
-
-// --- Mid Visualization ---
+// --- Mid Visualization - "Swirling Vortex / Galaxy"
 fn draw_mid_visuals(
     display_image: &mut RgbImage,
     mask_image: &ImageBuffer<Luma<u8>, Vec<u8>>,
     bbox_rect: Rect,
-    intensity: f32,
+    intensity: f32, // 0.0 to 1.0
     frame_count: u64,
-    animation_phase: f32,
+    animation_phase: f32, // Use for rotation base
     rng: &mut impl Rng,
 ) {
-    // Palette: Green -> Cyan -> Yellow-Green
-    let color1 = lerp_color(Rgb([0, 180, 50]), Rgb([0, 255, 150]), intensity); // Green -> Cyanish
-    let color2 = lerp_color(Rgb([150, 255, 0]), Rgb([50, 200, 50]), intensity); // Yellow-Green -> Greenish
+    let center_x = bbox_rect.left() as f32 + bbox_rect.width() as f32 / 2.0;
+    let center_y = bbox_rect.top() as f32 + bbox_rect.height() as f32 / 2.0;
+    let max_dist = (bbox_rect.width().max(bbox_rect.height()) as f32 * 0.7).max(1.0);
 
-    // Angle for linear gradient based on time/intensity
-    let angle_rad = (frame_count as f32 * 0.02 + intensity * PI).sin() * (PI / 4.0); // Oscillate +/- 45 deg
-    let (sin_a, cos_a) = (angle_rad.sin(), angle_rad.cos());
-    let center_x = (bbox_rect.left() + bbox_rect.width() as i32 / 2) as f32;
-    let center_y = (bbox_rect.top() + bbox_rect.height() as i32 / 2) as f32;
-    let max_proj_dist = (bbox_rect.width() as f32 * cos_a.abs() + bbox_rect.height() as f32 * sin_a.abs()) * 0.5 + 1.0;
+    // Palette: Greens, Blues, Purples swirling
+    let color1 = Rgb([0, 200, 50]); // Green
+    let color2 = Rgb([0, 150, 200]); // Cyan/Blue
+    let color3 = Rgb([100, 50, 200]); // Purple
 
+    // Intensity effects
+    let rotation_speed = 0.01 + intensity * 0.05;
+    let noise_amount = 0.1 + intensity * 0.4; // How much noise distorts the swirl
+    let brightness_boost = intensity * 0.5; // Boost overall brightness
 
-    // 1. Linear Gradient Fill (dynamic angle)
     for y in bbox_rect.top()..bbox_rect.bottom() {
         for x in bbox_rect.left()..bbox_rect.right() {
             if is_inside_mask(x, y, mask_image) {
-                // Project pixel onto the gradient direction vector
+                // --- Calculate coordinates relative to center ---
                 let rel_x = x as f32 - center_x;
                 let rel_y = y as f32 - center_y;
-                let projected_dist = rel_x * cos_a + rel_y * sin_a;
-                let gradient_t = (projected_dist / max_proj_dist + 1.0) * 0.5; // Normalize to 0-1
-                let base_viz_color = lerp_color(color1, color2, gradient_t.clamp(0.0, 1.0));
-                display_image.put_pixel(x as u32, y as u32, base_viz_color);
+                let dist = (rel_x * rel_x + rel_y * rel_y).sqrt();
+                let mut angle = rel_y.atan2(rel_x); // Current angle
+
+                // --- Add swirl based on distance and time/phase ---
+                // Rotate more closer to the center, speed based on intensity
+                let rotation_factor = (1.0 - (dist / max_dist)).powi(2); // Rotate more near center
+                let rotation_amount =
+                    animation_phase + frame_count as f32 * rotation_speed * rotation_factor;
+                angle += rotation_amount;
+
+                // --- Add noise distortion to angle and distance ---
+                let noise_seed = frame_count as f32 * 0.01;
+                let noise_val = spatial_noise(rel_x * 0.05, rel_y * 0.05, noise_seed);
+                angle += (noise_val - 0.5) * PI * 0.3 * noise_amount; // Distort angle
+                let noisy_dist = dist
+                    * (1.0
+                        + (spatial_noise(rel_x * 0.02, rel_y * 0.02, noise_seed + 10.0) - 0.5)
+                            * 0.4
+                            * noise_amount);
+
+                // --- Map angle and distance to color ---
+                let angle_norm = (angle / (2.0 * PI) + 10.0) % 1.0; // Normalize angle 0-1 (add offset to avoid seam issues)
+                let dist_norm = (noisy_dist / max_dist).clamp(0.0, 1.0);
+
+                // Blend colors based on angle
+                let color_mix;
+                if angle_norm < 0.333 {
+                    color_mix = lerp_color(color1, color2, angle_norm / 0.333);
+                } else if angle_norm < 0.666 {
+                    color_mix = lerp_color(color2, color3, (angle_norm - 0.333) / 0.333);
+                } else {
+                    color_mix = lerp_color(color3, color1, (angle_norm - 0.666) / 0.333);
+                }
+
+                // Fade to black at edges and based on distance noise
+                let fade = (1.0 - dist_norm.powf(1.5)) * (1.0 - (noise_val * 0.5 * noise_amount)); // Fade near edge and by noise
+                let base_color = lerp_color(BLACK, color_mix, fade.clamp(0.0, 1.0));
+
+                // Add brightness boost and random sparkles
+                let mut final_color = lerp_color(base_color, WHITE, brightness_boost * fade); // Boost brightness towards center
+                if rng.gen::<f32>() < 0.005 * intensity {
+                    // Sparse sparkles
+                    final_color = lerp_color(final_color, WHITE, 0.8);
+                }
+
+                display_image.put_pixel(x as u32, y as u32, final_color);
             }
         }
     }
-
-    // 2. Flowing Lines Texture Overlay
-    let line_density = (intensity * 15.0).ceil() as i32; // More lines with intensity
-    let line_speed = animation_phase * 20.0; // Faster movement
-    let line_color = lerp_color(color2, WHITE, 0.6); // Use lighter color for lines
-
-    for i in 0..line_density {
-         // Horizontal flowing lines
-         let flow_y_base = bbox_rect.height() as f32 * (i as f32 / line_density as f32);
-         let flow_y_offset = (bbox_rect.height() as f32 * 0.1 * (line_speed * 0.1 + i as f32 * 0.5).sin());
-         let flow_y = bbox_rect.top() + (flow_y_base + flow_y_offset) as i32;
-
-         // Vertical flowing lines
-         let flow_x_base = bbox_rect.width() as f32 * (i as f32 / line_density as f32);
-         let flow_x_offset = (bbox_rect.width() as f32 * 0.1 * (line_speed * 0.08 + i as f32 * 0.7).cos());
-         let flow_x = bbox_rect.left() + (flow_x_base + flow_x_offset) as i32;
-
-         // Draw horizontal line segment
-         for x in bbox_rect.left()..bbox_rect.right() {
-             if flow_y >= bbox_rect.top() && flow_y < bbox_rect.bottom() && is_inside_mask(x, flow_y, mask_image) {
-                 let existing = display_image.get_pixel(x as u32, flow_y as u32);
-                 display_image.put_pixel(x as u32, flow_y as u32, lerp_color(*existing, line_color, 0.4)); // Blend weakly
-             }
-         }
-         // Draw vertical line segment
-          for y in bbox_rect.top()..bbox_rect.bottom() {
-             if flow_x >= bbox_rect.left() && flow_x < bbox_rect.right() && is_inside_mask(flow_x, y, mask_image) {
-                  let existing = display_image.get_pixel(flow_x as u32, y as u32);
-                  display_image.put_pixel(flow_x as u32, y as u32, lerp_color(*existing, line_color, 0.4)); // Blend weakly
-             }
-         }
-    }
 }
 
-
-// --- High Visualization ---
+// --- High Visualization - "Electric Static Field / Jagged Lines" 
 fn draw_high_visuals(
     display_image: &mut RgbImage,
     mask_image: &ImageBuffer<Luma<u8>, Vec<u8>>,
     bbox_rect: Rect,
     intensity: f32,
-    frame_count: u64, // Use frame_count for some dynamic behavior
-    _animation_phase: f32, // Mark as unused
+    frame_count: u64,
+    _animation_phase: f32,
     rng: &mut impl Rng,
 ) {
-    // Palette: Electric Blue -> Purple -> White flash
-    let base_blue = Rgb([0, 50, 255]);
-    let purple = Rgb([180, 0, 255]);
-    let flash_color = WHITE; // Flash pure white
+    let color_low = Rgb([0, 0, 50]);
+    let color_mid = Rgb([100, 50, 255]);
+    let color_high = WHITE;
+    let field_intensity = intensity.powi(2);
+    let line_intensity = intensity.sqrt();
+    let noise_seed1 = frame_count as f32 * 0.1;
+    let noise_seed2 = frame_count as f32 * -0.07;
 
-    // Base color shifts towards purple/white based on intensity
-    let dynamic_base = lerp_color(base_blue, purple, intensity.powi(2));
-
-    // 1. Optional: Keep a subtle noisy background fill
     for y in bbox_rect.top()..bbox_rect.bottom() {
         for x in bbox_rect.left()..bbox_rect.right() {
             if is_inside_mask(x, y, mask_image) {
-                let noise_factor = rng.gen::<f32>() * 0.2 - 0.1; // Less intense noise: -0.1 to +0.1
-                let noise_intensity_factor = 1.0 + noise_factor * intensity;
-                let r = (dynamic_base[0] as f32 * noise_intensity_factor).clamp(0.0, 255.0) as u8;
-                let g = (dynamic_base[1] as f32 * noise_intensity_factor).clamp(0.0, 255.0) as u8;
-                let b = (dynamic_base[2] as f32 * noise_intensity_factor).clamp(0.0, 255.0) as u8;
-                // Blend slightly with black for depth
-                let base_viz_color = lerp_color(BLACK, Rgb([r, g, b]), 0.8);
-                display_image.put_pixel(x as u32, y as u32, base_viz_color);
-            }
-        }
-    }
+                let noise_val1 = spatial_noise(x as f32 * 0.08, y as f32 * 0.08, noise_seed1);
+                let noise_val2 = spatial_noise(x as f32 * 0.03, y as f32 * 0.03, noise_seed2);
+                let combined_noise = (noise_val1 * 0.6 + noise_val2 * 0.4 + rng.gen::<f32>() * 0.2
+                    - 0.1)
+                    .clamp(0.0, 1.0);
+                let field_color =
+                    lerp_color(color_low, color_mid, combined_noise * field_intensity * 1.5);
 
-    // 2. Jagged Vertical Lines / EQ Bars
-    let num_lines = (bbox_rect.width() as f32 / 4.0).max(3.0).min(50.0) as i32; // Lines every ~4 pixels, min 3, max 50
-    let line_spacing = bbox_rect.width() as f32 / num_lines as f32;
-    let max_height = bbox_rect.height() as f32;
+                let num_lines = 8.0 + line_intensity * 20.0;
+                let line_phase = frame_count as f32 * 0.15;
+                let line_y_norm =
+                    (y as f32 / bbox_rect.height() as f32 * num_lines + line_phase) % 1.0; // Use bbox height
+                let jag_noise_scale = 0.1;
+                let jag_noise = spatial_noise(
+                    x as f32 * jag_noise_scale,
+                    y as f32 * jag_noise_scale,
+                    noise_seed1 + 10.0,
+                );
+                let line_threshold = 0.05 + jag_noise * 0.1;
+                let line_brightness = if line_y_norm < line_threshold {
+                    (1.0 - line_y_norm / line_threshold) * line_intensity.powi(2) * 1.5
+                } else {
+                    0.0
+                };
 
-    for i in 0..num_lines {
-        let line_x = bbox_rect.left() + (i as f32 * line_spacing + line_spacing * 0.5) as i32;
-
-        // Base height determined by intensity
-        let base_height = max_height * intensity;
-
-        // Add dynamic flicker/jaggedness based on intensity and frame count/randomness
-        let flicker_intensity = intensity.powi(2); // Make flicker stronger at high intensity
-        let random_flicker = rng.gen::<f32>() * 0.6 - 0.3; // Random height variation +/- 30%
-        let time_flicker = (frame_count as f32 * 0.5 + i as f32 * 1.5).sin() * 0.2; // Temporal variation +/- 20%
-        let total_flicker = (random_flicker + time_flicker) * flicker_intensity;
-
-        let current_height = (base_height * (1.0 + total_flicker)).clamp(0.0, max_height);
-        let line_top = bbox_rect.bottom() - current_height as i32; // Lines grow from bottom
-        let line_bottom = bbox_rect.bottom();
-
-        // Color transitions towards white flash based on intensity and flicker peak
-        let color_intensity = (intensity + total_flicker.max(0.0) * 0.5).clamp(0.0, 1.0); // Boost color intensity with positive flicker
-        let line_color = lerp_color(dynamic_base, flash_color, color_intensity.powi(3)); // Fast transition to white
-
-        // Draw the vertical line segment
-        for y in line_top..line_bottom {
-            if is_inside_mask(line_x, y, mask_image) {
-                // Blend with background for softer look? Or overwrite for sharpness? Let's overwrite.
-                display_image.put_pixel(line_x as u32, y as u32, line_color);
-                // Optional: Thicker line?
-                 if is_inside_mask(line_x + 1, y, mask_image) {
-                      display_image.put_pixel((line_x + 1) as u32, y as u32, line_color);
-                 }
+                let final_color =
+                    lerp_color(field_color, color_high, line_brightness.clamp(0.0, 1.0));
+                display_image.put_pixel(x as u32, y as u32, final_color);
             }
         }
     }
 }
 
-
-// --- Main Public Function ---
+// --- Main Public Function --- RESTORED DISPATCHER ---
 pub fn draw_visuals(
     display_image: &mut RgbImage,
     mask_image: &ImageBuffer<Luma<u8>, Vec<u8>>,
@@ -244,16 +217,46 @@ pub fn draw_visuals(
     animation_phase: f32,
     rng: &mut impl Rng,
 ) {
-    // Ensure mask dimensions match (should be guaranteed by segmentation part)
+    // Dimension check (important!)
     if mask_image.dimensions() != display_image.dimensions() {
-        log::warn!("Visuals: Mask dimension mismatch!");
-        return;
+        // This might happen if camera resolution changes mid-stream before masks update?
+        // log::warn!("Visuals: Mask ({:?}) and Display ({:?}) dimension mismatch!", mask_image.dimensions(), display_image.dimensions());
+        return; // Skip drawing if dimensions mismatch
     }
+    if bbox_rect.width() == 0 || bbox_rect.height() == 0 {
+        return;
+    } // Skip empty rects
 
     match slot_index {
-        0 => draw_bass_visuals(display_image, mask_image, bbox_rect, intensity, frame_count, animation_phase, rng),
-        1 => draw_mid_visuals(display_image, mask_image, bbox_rect, intensity, frame_count, animation_phase, rng),
-        2 => draw_high_visuals(display_image, mask_image, bbox_rect, intensity, frame_count, animation_phase, rng),
-        _ => { /* Should not happen */ }
+        0 => draw_bass_visuals(
+            display_image,
+            mask_image,
+            bbox_rect,
+            intensity,
+            frame_count,
+            animation_phase,
+            rng,
+        ),
+        1 => draw_mid_visuals(
+            display_image,
+            mask_image,
+            bbox_rect,
+            intensity,
+            frame_count,
+            animation_phase,
+            rng,
+        ),
+        2 => draw_high_visuals(
+            display_image,
+            mask_image,
+            bbox_rect,
+            intensity,
+            frame_count,
+            animation_phase,
+            rng,
+        ),
+        _ => {
+            log::warn!("Visuals: Invalid slot {}", slot_index);
+        }
     }
 }

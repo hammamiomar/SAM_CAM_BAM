@@ -1,64 +1,51 @@
 // src/ui.rs
+use cpal::{traits::StreamTrait, Stream};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use egui::{widgets, Align, Color32, ImageData, Layout, TextureHandle, TextureOptions, Vec2};
+use log::{error, info, warn};
+use nokhwa::utils::{CameraIndex, Resolution};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
-use egui::{
-    Align, Color32, ImageData, Layout, Pos2, Rect, Response, Sense, Stroke, Spinner,
-    TextureHandle, TextureOptions, Vec2, widgets,
-};
-use log::{error, info, warn};
-use nokhwa::utils::{CameraIndex, Resolution};
-use cpal::{traits::StreamTrait, Stream}; // Need Stream to hold onto it
 
 use crate::{
-    camera::{self, CameraThreadMsg},
-    segmentation::{self, SegmentationThreadMsg, UserInteractionSegMsg, MAX_TRACKS, TRACK_COLORS},
-    music::{self, AudioProcessor}, // Updated import
-    live_audio, // Added import
+    camera::{self},
+    live_audio,
+    music::{self},
+    segmentation::{self, SegmentationThreadMsg, UserInteractionSegMsg, MAX_TRACKS},
 };
 
 const FPS_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
-
-// Enum to represent the status of the live audio capture
 #[derive(Debug, Clone, PartialEq)]
 enum LiveAudioStatus {
     Initializing,
-    Running(u32, u16), // Sample Rate, Channels
+    Running(u32, u16),
     Error(String),
-    Disabled, // Or Stopped
+    Disabled,
 }
 
 pub struct WebcamAppUI {
-    // --- Core ---
     texture: Option<TextureHandle>,
     seg_to_ui_rx: Receiver<SegmentationThreadMsg>,
-    user_interaction_tx: Sender<UserInteractionSegMsg>,
-
-    // --- Threads & Signals ---
+    _user_interaction_tx: Sender<UserInteractionSegMsg>,
     cam_thread_handle: Option<JoinHandle<()>>,
     cam_stop_signal: Arc<AtomicBool>,
     seg_thread_handle: Option<JoinHandle<()>>,
     seg_stop_signal: Arc<AtomicBool>,
-    audio_capture_thread_handle: Option<Stream>, // cpal stream handle
+    audio_capture_thread_handle: Option<Stream>,
     audio_capture_stop_signal: Arc<AtomicBool>,
     audio_processor_thread_handle: Option<JoinHandle<()>>,
     audio_processor_stop_signal: Arc<AtomicBool>,
-
-    // --- State ---
-    camera_error: Option<String>, // Specific camera errors
-    seg_error: Option<String>,    // Specific segmentation/processing errors
-    live_audio_status: LiveAudioStatus, // Status of audio capture
+    camera_error: Option<String>,
+    seg_error: Option<String>,
+    live_audio_status: LiveAudioStatus,
     camera_resolution: Option<Resolution>,
     texture_size: Option<Vec2>,
-    current_selection_slot: usize,
-
-    // --- Performance ---
     last_fps_update_time: Instant,
     frames_since_last_update: u32,
     last_calculated_fps: f32,
@@ -66,122 +53,93 @@ pub struct WebcamAppUI {
 
 impl WebcamAppUI {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        info!("Initializing WebcamAppUI with FastSAM (Multi-Object + Live Audio)");
-        let camera_index = CameraIndex::Index(0); // Or allow selection
-
-        // Configure Model Options for FastSAM
-        let device_str = "mps"; // Or "cpu", "cuda", etc.
-        let dtype_str = "fp16"; // Or "fp32"
+        info!("Initializing WebcamAppUI (Persistent Random Assignment Viz)"); // Log updated
+        let camera_index = CameraIndex::Index(0);
+        let device_str = "mps";
+        let dtype_str = "fp16";
         let model_options = match usls::Options::fastsam_s()
-            .with_model_device(device_str.try_into().expect("Bad device string"))
+            .with_model_device(device_str.try_into().expect("Bad device"))
             .with_model_dtype(dtype_str.try_into().unwrap_or(usls::DType::Fp32))
-            .with_model_file("models/FastSAM-s.onnx") // Ensure this path is correct!
-            .with_nc(1) // Number of classes (1 for generic "object")
+            .with_model_file("models/FastSAM-s.onnx")
+            .with_nc(1)
             .with_class_names(&["object"])
-            .with_class_confs(&[0.35]) // Confidence threshold
-            .with_iou(0.45) // IoU threshold for NMS
-            .with_find_contours(true) // Find contours for masks
+            .with_class_confs(&[0.35])
+            .with_iou(0.45)
+            .with_find_contours(true)
             .commit()
-         {
-            Ok(opts) => opts,
+        {
+            Ok(o) => o,
             Err(e) => {
-                // Use panic here because the app can't run without model options
-                panic!("FATAL: Model options failed to commit: {}. Check model path and dependencies.", e);
+                panic!("Model opts failed: {}", e)
             }
-         };
-
-
-        // --- Channels ---
-        let (cam_to_seg_tx, cam_to_seg_rx) = unbounded::<CameraThreadMsg>();
-        let (seg_to_ui_tx, seg_to_ui_rx) = bounded::<SegmentationThreadMsg>(1); // Bounded to prevent UI lag
-        let (user_interaction_tx, user_interaction_rx) = unbounded::<UserInteractionSegMsg>();
-        // Audio Channels
-        let (raw_samples_tx, raw_samples_rx) = bounded::<Vec<f32>>(10); // Bounded channel for audio samples
-        let (intensities_tx, intensities_rx) = bounded::<Vec<f32>>(5);  // Bounded channel for FFT results
-
-
-        // --- Stop Signals ---
+        };
+        let (cam_to_seg_tx, cam_to_seg_rx) = unbounded();
+        let (seg_to_ui_tx, seg_to_ui_rx) = bounded(1);
+        let (_user_interaction_tx, user_interaction_rx) = unbounded(); // Keep channel
+        let (raw_samples_tx, raw_samples_rx) = bounded(10);
+        let (intensities_tx, intensities_rx) = bounded(5);
         let cam_stop_signal = Arc::new(AtomicBool::new(false));
         let seg_stop_signal = Arc::new(AtomicBool::new(false));
         let audio_capture_stop_signal = Arc::new(AtomicBool::new(false));
         let audio_processor_stop_signal = Arc::new(AtomicBool::new(false));
-
-        // Clones for threads
-        let cam_stop_signal_clone = cam_stop_signal.clone();
-        let cam_ctx_clone = cc.egui_ctx.clone();
-        let seg_stop_signal_clone = seg_stop_signal.clone();
-        let seg_ctx_clone = cc.egui_ctx.clone();
-        let audio_capture_stop_signal_clone = audio_capture_stop_signal.clone();
-        let audio_processor_stop_signal_clone = audio_processor_stop_signal.clone();
-
-
-        // --- Start Camera Thread ---
-        let cam_thread_handle = Some(camera::start_camera_thread(
-            camera_index, cam_to_seg_tx, cam_stop_signal_clone, cam_ctx_clone,
+        let cam_stop_clone = cam_stop_signal.clone();
+        let cam_ctx = cc.egui_ctx.clone();
+        let seg_stop_clone = seg_stop_signal.clone();
+        let seg_ctx = cc.egui_ctx.clone();
+        let audio_cap_stop = audio_capture_stop_signal.clone();
+        let audio_proc_stop = audio_processor_stop_signal.clone();
+        let cam_thread = Some(camera::start_camera_thread(
+            camera_index,
+            cam_to_seg_tx,
+            cam_stop_clone,
+            cam_ctx,
         ));
-
-        // --- Start Audio Capture ---
-        let mut initial_audio_status = LiveAudioStatus::Initializing;
-        let audio_capture_thread_handle = match live_audio::start_audio_capture(
-            raw_samples_tx, // Sender for raw audio data
-            audio_capture_stop_signal_clone,
-        ) {
-            Ok((stream, rate, channels)) => {
-                initial_audio_status = LiveAudioStatus::Running(rate, channels);
-                Some(stream) // Keep the stream object alive
+        let initial_audio_status;
+        let audio_capture_thread =
+            match live_audio::start_audio_capture(raw_samples_tx, audio_cap_stop) {
+                Ok((s, r, c)) => {
+                    initial_audio_status = LiveAudioStatus::Running(r, c);
+                    Some(s)
+                }
+                Err(e) => {
+                    let m = format!("Audio capture failed: {}", e);
+                    error!("{}", m);
+                    initial_audio_status = LiveAudioStatus::Error(m);
+                    None
+                }
+            };
+        let audio_processor_thread = match initial_audio_status {
+            LiveAudioStatus::Running(r, c) => {
+                let mut p =
+                    music::AudioProcessor::new(raw_samples_rx, intensities_tx, r, c, MAX_TRACKS);
+                Some(std::thread::spawn(move || p.run(audio_proc_stop)))
             }
-            Err(e) => {
-                let err_msg = format!("Failed to start audio capture: {}", e);
-                error!("{}", err_msg);
-                initial_audio_status = LiveAudioStatus::Error(err_msg);
+            _ => {
+                warn!("No audio proc started.");
                 None
             }
         };
-
-        // --- Start Audio Processor Thread ---
-        let audio_processor_thread_handle = match initial_audio_status {
-            LiveAudioStatus::Running(rate, channels) => {
-                let mut audio_processor = music::AudioProcessor::new(
-                    raw_samples_rx, // Receiver for raw audio
-                    intensities_tx, // Sender for FFT results
-                    rate,
-                    channels,
-                    MAX_TRACKS, // Number of bands needed
-                );
-                 // Spawn the processor's run loop
-                 Some(std::thread::spawn(move || {
-                    audio_processor.run(audio_processor_stop_signal_clone);
-                }))
-            }
-             _ => {
-                warn!("Audio capture failed, not starting audio processor thread.");
-                None // Don't start if capture failed
-            }
-        };
-
-
-        // --- Start Segmentation Thread ---
-        let seg_thread_handle = Some(segmentation::start_segmentation_thread(
+        let seg_thread = Some(segmentation::start_segmentation_thread(
             seg_to_ui_tx,
             cam_to_seg_rx,
             user_interaction_rx,
-            intensities_rx, // Pass intensity receiver
-            seg_stop_signal_clone,
-            seg_ctx_clone,
+            intensities_rx,
+            seg_stop_clone,
+            seg_ctx,
             model_options,
-        ));
+        )); // Pass user_interaction_rx
 
         Self {
             texture: None,
-            user_interaction_tx,
             seg_to_ui_rx,
-            cam_thread_handle,
+            _user_interaction_tx, // Store sender
+            cam_thread_handle: cam_thread,
             cam_stop_signal,
-            seg_thread_handle,
+            seg_thread_handle: seg_thread,
             seg_stop_signal,
-            audio_capture_thread_handle,
+            audio_capture_thread_handle: audio_capture_thread,
             audio_capture_stop_signal,
-            audio_processor_thread_handle,
+            audio_processor_thread_handle: audio_processor_thread,
             audio_processor_stop_signal,
             camera_error: None,
             seg_error: None,
@@ -191,385 +149,246 @@ impl WebcamAppUI {
             last_fps_update_time: Instant::now(),
             frames_since_last_update: 0,
             last_calculated_fps: 0.0,
-            current_selection_slot: 0,
         }
     }
 
     fn update_fps_counter(&mut self) {
+        /* Unchanged */
         self.frames_since_last_update += 1;
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_fps_update_time);
-
-        if elapsed >= FPS_UPDATE_INTERVAL {
-            let elapsed_secs = elapsed.as_secs_f32();
-            self.last_calculated_fps = if elapsed_secs > 0.0 {
-                self.frames_since_last_update as f32 / elapsed_secs
-            } else { f32::INFINITY };
+        let n = Instant::now();
+        let e = n.duration_since(self.last_fps_update_time);
+        if e >= FPS_UPDATE_INTERVAL {
+            self.last_calculated_fps =
+                self.frames_since_last_update as f32 / e.as_secs_f32().max(0.001);
             self.frames_since_last_update = 0;
-            self.last_fps_update_time = now;
-            // log::debug!("UI FPS: {:.1}", self.last_calculated_fps); // Optional: log FPS
+            self.last_fps_update_time = n;
         }
-    }
-
-    fn ui_pos_to_image_coords(
-        &self,
-        ui_pos: Pos2,
-        image_rect: Rect,
-        displayed_image_size: Vec2,
-    ) -> Option<(f32, f32)> {
-         if !image_rect.contains(ui_pos) { return None; }
-         if let Some(original_res) = self.camera_resolution {
-             let original_width = original_res.width() as f32;
-             let original_height = original_res.height() as f32;
-             if displayed_image_size.x <= 0.0 || displayed_image_size.y <= 0.0 {
-                 warn!("Displayed image size has zero dimension: {:?}", displayed_image_size);
-                 return None;
-             }
-             // Coordinates relative to the top-left of the displayed image rect
-             let relative_pos = ui_pos - image_rect.min;
-             // Normalize coordinates based on the *displayed* size in the UI
-             let norm_x = (relative_pos.x / displayed_image_size.x).clamp(0.0, 1.0);
-             let norm_y = (relative_pos.y / displayed_image_size.y).clamp(0.0, 1.0);
-             // Scale normalized coordinates to the original image dimensions
-             let image_x = norm_x * original_width;
-             let image_y = norm_y * original_height;
-
-             // Ensure the calculated coordinates are within the original image bounds
-             if image_x >= 0.0 && image_x < original_width && image_y >= 0.0 && image_y < original_height {
-                  Some((image_x, image_y))
-             } else {
-                  // This should ideally not happen if normalization/scaling is correct, but clamp defensively
-                  warn!("Calculated image coords slightly out of bounds: ({}, {}), clamping.", image_x, image_y);
-                  Some((image_x.clamp(0.0, original_width - 1.0), image_y.clamp(0.0, original_height - 1.0)))
-             }
-         } else { None } // Original resolution unknown
     }
 }
 
 impl eframe::App for WebcamAppUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_fps_counter();
-
-        // --- 1. Process incoming messages FIRST (mutates state) ---
         let mut received_frame_this_update = false;
         loop {
             match self.seg_to_ui_rx.try_recv() {
                 Ok(msg) => match msg {
-                    SegmentationThreadMsg::Frame(processed_frame_arc) => {
+                    SegmentationThreadMsg::Frame(f) => {
                         received_frame_this_update = true;
-                        let size = processed_frame_arc.size;
-                        let frame_size_vec = Vec2::new(size[0] as f32, size[1] as f32);
-
-                        // Check and update camera resolution if needed
-                        if self.camera_resolution.is_none() ||
-                           self.camera_resolution.map_or(false, |res| res.width() != size[0] as u32 || res.height() != size[1] as u32)
-                        {
-                            let new_res = Resolution::new(size[0] as u32, size[1] as u32);
-                            if self.camera_resolution.is_some() {
-                                warn!("Frame resolution ({:?}) differs from stored camera resolution ({:?}). Updating and clearing selections.", size, self.camera_resolution.unwrap());
-                                // Resolution changed, likely invalidates selections
-                                let _ = self.user_interaction_tx.send(UserInteractionSegMsg::ClearSelection);
-                            } else {
-                                info!("Received first frame, setting camera resolution to {}x{}", size[0], size[1]);
-                            }
-                            self.camera_resolution = Some(new_res);
-                            self.texture_size = Some(frame_size_vec); // Update texture size as well
+                        let s = f.size;
+                        let sz = Vec2::new(s[0] as f32, s[1] as f32);
+                        if self.camera_resolution.map_or(true, |r| {
+                            r.width() != s[0] as u32 || r.height() != s[1] as u32
+                        }) {
+                            self.camera_resolution =
+                                Some(Resolution::new(s[0] as u32, s[1] as u32));
+                            self.texture_size = Some(sz);
                         }
-
-                        // Update egui texture
                         match self.texture {
-                            Some(ref mut texture) => {
-                                texture.set(ImageData::Color(processed_frame_arc), TextureOptions::LINEAR);
-                            }
+                            Some(ref mut t) => t.set(ImageData::Color(f), TextureOptions::LINEAR),
                             None => {
-                                let new_texture = ctx.load_texture(
-                                    "webcam_stream", // Texture name
-                                    ImageData::Color(processed_frame_arc),
-                                    TextureOptions::LINEAR, // Or NEAREST
-                                );
-                                self.texture = Some(new_texture);
+                                self.texture = Some(ctx.load_texture(
+                                    "vis",
+                                    ImageData::Color(f),
+                                    TextureOptions::LINEAR,
+                                ))
                             }
                         }
-                        // Clear segmentation error if we successfully received a frame
                         self.seg_error = None;
                     }
-                    SegmentationThreadMsg::Error(err) => {
-                         // Avoid logging the same error repeatedly
-                         if self.seg_error.as_ref() != Some(&err) {
-                             error!("Segmentation Thread Error: {}", err);
-                             self.seg_error = Some(err);
-                         }
+                    SegmentationThreadMsg::Error(e) => {
+                        if self.seg_error.as_ref() != Some(&e) {
+                            self.seg_error = Some(e);
+                        }
                     }
-                    // SegmentationThreadMsg::AudioLoaded(_) => { /* Removed */ }
                 },
-                Err(TryRecvError::Empty) => break, // No more messages this cycle
+                Err(TryRecvError::Empty) => {
+                    break;
+                }
                 Err(TryRecvError::Disconnected) => {
-                    let err_msg = "Segmentation thread disconnected unexpectedly.".to_string();
-                    error!("{}", err_msg);
-                    if self.seg_error.is_none() { self.seg_error = Some(err_msg); } // Show error in UI
-                    // Attempt to join the thread to clean up resources
-                    if let Some(handle) = self.seg_thread_handle.take() {
-                         warn!("Attempting to join disconnected segmentation thread...");
-                         if let Err(e) = handle.join() { self.seg_error = Some(format!("Segmentation thread panicked: {:?}", e)); }
+                    let m = "Seg disconnected.".to_string();
+                    if self.seg_error.is_none() {
+                        self.seg_error = Some(m);
                     }
-                    break; // Stop processing messages from this disconnected channel
-                 }
+                    if let Some(h) = self.seg_thread_handle.take() {
+                        let _ = h.join();
+                    }
+                    break;
+                }
             }
         }
 
-        // --- 2. Prepare state for UI drawing ---
-        // let mut trigger_file_dialog = false; // Removed
-        let mut clear_all_clicked = false;
-        let mut interaction_error_this_frame: Option<String> = None;
-        let mut new_selection_slot = self.current_selection_slot; // Local copy for radio buttons
-
-        // --- 3. Define and draw UI ---
+        // --- Simplified UI ---
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-             egui::menu::bar(ui, |ui| {
-                 let is_web = cfg!(target_arch = "wasm32");
-                 if !is_web {
+            egui::menu::bar(ui, |ui| {
+                if !cfg!(target_arch = "wasm32") {
                     ui.menu_button("File", |ui| {
-                         if ui.button("Quit").clicked() {
+                        if ui.button("Quit").clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                         }
+                        }
                     });
                     ui.add_space(16.0);
-                 }
-                 widgets::global_dark_light_mode_buttons(ui); // Use the new helper
-             });
-         });
+                }
+                widgets::global_theme_preference_buttons(ui);
+            });
+        });
 
         egui::SidePanel::left("control_panel")
             .resizable(false)
-            .default_width(180.0) // Slightly wider for audio status
+            .default_width(180.0)
             .show(ctx, |ui| {
-                ui.heading("Track Control").on_hover_text("Assign audio bands to detected objects"); ui.separator();
-                ui.label("Select target slot:");
-                ui.vertical(|ui| {
-                    for i in 0..MAX_TRACKS {
-                        ui.horizontal(|ui| {
-                            let color = TRACK_COLORS[i];
-                            let egui_color = Color32::from_rgb(color[0], color[1], color[2]);
-                            let is_selected = new_selection_slot == i; // Use local var
-
-                            // Use radio_value for simpler state management
-                            if ui.radio_value(&mut new_selection_slot, i, "").clicked() {
-                                // State is updated automatically by radio_value
-                                info!("Selected slot {}", i);
-                            };
-
-                            // Draw colored rectangle next to radio button
-                            let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
-                            let stroke = if is_selected { Stroke::new(2.0, ui.visuals().widgets.active.fg_stroke.color) } else { Stroke::NONE };
-                            ui.painter().rect_filled(rect, 3.0, egui_color);
-                            ui.painter().rect_stroke(rect, 3.0, stroke,egui::StrokeKind::Inside);
-
-                            let label_text = match i {
-                                0 => "Track 1 (Bass)",
-                                1 => "Track 2 (Mid)",
-                                2 => "Track 3 (High)",
-                                _ => "Track ?",
-                            };
-                             ui.label(label_text).on_hover_text(format!("Click object in view to assign to {}", label_text));
-                        });
-                    }
-                });
-                ui.separator();
-                ui.label("Left-Click Image: Assign object to selected track.");
-                ui.label("Right-Click Image: Remove track at click location.");
-                ui.separator();
-                if ui.button("Clear All Selections").clicked() { clear_all_clicked = true; }
-                ui.separator();
-
-                ui.heading("Audio Status");
+                ui.heading("Audio Status")
+                    .on_hover_text("Status of live audio capture");
                 ui.separator();
                 match &self.live_audio_status {
-                    LiveAudioStatus::Initializing => { ui.horizontal(|ui| { ui.spinner(); ui.label("Initializing..."); }); }
-                    LiveAudioStatus::Running(rate, channels) => { ui.label(format!("Capturing: {} Hz, {} ch", rate, channels)).on_hover_text("Capturing live audio output"); }
-                    LiveAudioStatus::Error(err) => { ui.colored_label(Color32::RED, "Error").on_hover_text(err); }
-                    LiveAudioStatus::Disabled => { ui.colored_label(Color32::GRAY, "Disabled"); }
+                    /* Display status */
+                    LiveAudioStatus::Initializing => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Initializing...");
+                        });
+                    }
+                    LiveAudioStatus::Running(r, c) => {
+                        ui.label(format!("Capturing: {} Hz, {} ch", r, c));
+                    }
+                    LiveAudioStatus::Error(e) => {
+                        ui.colored_label(Color32::RED, "Error").on_hover_text(e);
+                    }
+                    LiveAudioStatus::Disabled => {
+                        ui.colored_label(Color32::GRAY, "Disabled/Stopped");
+                    }
                 }
                 ui.separator();
-
-
-                 ui.heading("Info"); ui.separator();
-                 ui.label(format!("UI FPS: {:.1}", self.last_calculated_fps));
-                 if let Some(res) = &self.camera_resolution { ui.label(format!("Cam Res: {}x{}", res.width(), res.height())); }
-                 else if self.camera_error.is_none() && self.seg_error.is_none() && self.texture.is_none() { ui.label("Cam Res: Initializing..."); }
-                 else if self.camera_error.is_some() || self.seg_error.is_some(){ ui.label("Cam Res: Error"); }
-                 else { ui.label("Cam Res: Waiting..."); } // Waiting for first frame
+                ui.heading("Info")
+                    .on_hover_text("Performance and status details");
+                ui.separator();
+                ui.label(format!("UI FPS: {:.1}", self.last_calculated_fps));
+                match &self.camera_resolution {
+                    Some(r) => {
+                        ui.label(format!("Cam Res: {}x{}", r.width(), r.height()));
+                    }
+                    None if self.camera_error.is_none()
+                        && self.seg_error.is_none()
+                        && self.texture.is_none() =>
+                    {
+                        ui.label("Cam Res: Initializing...");
+                    }
+                    None if self.camera_error.is_some() || self.seg_error.is_some() => {
+                        ui.label("Cam Res: Error");
+                    }
+                    _ => {
+                        ui.label("Cam Res: Waiting...");
+                    }
+                }
+                if let Some(err) = &self.camera_error {
+                    ui.separator();
+                    ui.colored_label(Color32::YELLOW, "Camera Error:")
+                        .on_hover_text(err);
+                    ui.small(err);
+                }
+                if let Some(err) = &self.seg_error {
+                    ui.separator();
+                    ui.colored_label(Color32::RED, "Processing Error:")
+                        .on_hover_text(err);
+                    ui.small(err);
+                }
             });
 
-        // Apply deferred radio button mutation AFTER drawing the panel
-        self.current_selection_slot = new_selection_slot;
-
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Display errors prominently if they exist
-            if let Some(err) = &self.camera_error { ui.colored_label(egui::Color32::YELLOW, format!("Camera Status: {}", err)); }
-            if let Some(err) = &self.seg_error { ui.colored_label(egui::Color32::RED, format!("Processing Status: {}", err)); }
-            if let LiveAudioStatus::Error(err) = &self.live_audio_status { ui.colored_label(egui::Color32::RED, format!("Audio Status: {}", err)); }
-
-
             match &self.texture {
                 Some(texture) => {
                     if let Some(tex_size) = self.texture_size {
-                        // Calculate display size maintaining aspect ratio
-                        let aspect_ratio = if tex_size.y > 0.0 { tex_size.x / tex_size.y } else { 1.0 };
-                        let available_width = ui.available_width();
-                        let available_height = ui.available_height();
-                        let mut image_width = available_width;
-                        let mut image_height = available_width / aspect_ratio;
-                        if image_height > available_height {
-                            image_height = available_height;
-                            image_width = available_height * aspect_ratio;
+                        let ar = if tex_size.y > 0.0 {
+                            tex_size.x / tex_size.y
+                        } else {
+                            1.0
+                        };
+                        let aw = ui.available_width();
+                        let ah = ui.available_height();
+                        let mut iw = aw;
+                        let mut ih = aw / ar;
+                        if ih > ah {
+                            ih = ah;
+                            iw = ah * ar;
                         }
-                        let displayed_size = Vec2::new(image_width, image_height);
-
-                        // Center the image
+                        let ds = Vec2::new(iw, ih);
                         ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                            let image_widget = egui::Image::new(texture) // Use texture ID and calculated size
-                                .max_height(image_height)
-                                .max_width(image_width)
-                                .sense(Sense::click()); // Sense clicks for interaction
-                            let response: Response = ui.add(image_widget);
-
-                            // --- Click Handlers: Send messages, store potential errors locally ---
-                            let tx = self.user_interaction_tx.clone(); // Clone sender for click handlers
-                            // Use interact_pointer_pos for position relative to screen/window
-                            // Then use ui_pos_to_image_coords to convert if it's within the image rect
-                            let interact_pos = response.interact_pointer_pos();
-                            let maybe_coords = interact_pos.and_then(|pos| {
-                                self.ui_pos_to_image_coords(pos, response.rect, displayed_size)
-                            });
-                            let slot_to_use = self.current_selection_slot; // Read current slot
-
-                            if response.clicked_by(egui::PointerButton::Primary) {
-                                if let Some((img_x, img_y)) = maybe_coords {
-                                    info!("LClick on Image -> Assign Slot {} @ ({:.1}, {:.1})", slot_to_use, img_x, img_y);
-                                    if let Err(e) = tx.send(UserInteractionSegMsg::SelectObject { slot: slot_to_use, x: img_x, y: img_y }) {
-                                        let err_msg = format!("Comm Err (Select): {}", e);
-                                        error!("{}", err_msg);
-                                        interaction_error_this_frame = Some(err_msg); // Store error locally
-                                    }
-                                } else if interact_pos.is_some() {
-                                    warn!("LClick outside image bounds (or resolution unknown).");
-                                }
-                            } else if response.clicked_by(egui::PointerButton::Secondary) {
-                                if let Some((img_x, img_y)) = maybe_coords {
-                                     info!("RClick on Image -> Remove @ ({:.1}, {:.1})", img_x, img_y);
-                                     if let Err(e) = tx.send(UserInteractionSegMsg::RemoveObjectAt { x: img_x, y: img_y }) {
-                                         let err_msg = format!("Comm Err (Remove): {}", e);
-                                         error!("{}", err_msg);
-                                         interaction_error_this_frame = Some(err_msg); // Store error locally
-                                     }
-                                } else if interact_pos.is_some() {
-                                     warn!("RClick outside image bounds (or resolution unknown).");
-                                }
-                            }
-                            // --- End Click Handlers ---
-
-                        }); // End ui.with_layout for centering
+                            let sized_texture = egui::load::SizedTexture::new(texture.id(), ds);
+                            ui.add(egui::Image::new(sized_texture)); // Display image, no interaction
+                        });
                     } else {
-                        // Should not happen if texture exists, but handle defensively
-                        ui.label("Texture exists but size unknown.");
+                        ui.centered_and_justified(|ui| ui.label("Texture size unknown."));
                     }
                 }
-                 None if self.camera_error.is_none() && self.seg_error.is_none() && self.live_audio_status != LiveAudioStatus::Disabled => {
-                     // No texture yet, no errors reported -> Show loading spinner
-                     ui.centered_and_justified(|ui| {
-                        ui.add(Spinner::new()); // Use egui's built-in spinner
+                None if self.live_audio_status != LiveAudioStatus::Disabled
+                    && self.camera_error.is_none()
+                    && self.seg_error.is_none() =>
+                {
+                    ui.centered_and_justified(|ui| {
+                        ui.spinner();
                         ui.label("Initializing stream...");
                     });
-                 }
-                 None => { // No texture, and likely an error occurred
+                }
+                None => {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(ui.visuals().error_fg_color, "Stream unavailable");
-                        ui.label("Check error messages in side panel or console.");
+                        ui.label("Check status panel.");
                     });
-                 }
-            } // End match &self.texture
-        }); // End CentralPanel
-
-        // --- 4. Process deferred actions AFTER drawing UI ---
-        if clear_all_clicked {
-            info!("Sending deferred ClearSelection message.");
-            if let Err(e) = self.user_interaction_tx.send(UserInteractionSegMsg::ClearSelection) {
-                let err_msg = format!("Comm Err (Clear): {}", e);
-                error!("{}", err_msg);
-                interaction_error_this_frame = Some(err_msg); // Store error locally
+                }
             }
-        }
+        });
 
-        // Removed file dialog trigger
-
-        // --- 5. Apply interaction error state mutation LAST ---
-        if let Some(err) = interaction_error_this_frame {
-            // Only update if no more critical error is already present from message loop
-            // Prioritize segmentation errors over interaction errors for display
-            if self.seg_error.is_none() {
-                self.seg_error = Some(err);
-            }
-        }
-
-        // Request repaint if no frame was received but we might need UI updates (e.g., status change)
         if !received_frame_this_update {
-             ctx.request_repaint_after(Duration::from_millis(100)); // Request repaint reasonably soon
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
-
-    } // --- End of update method ---
+    } 
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        info!("Exit requested. Stopping all threads...");
 
-        // 1. Signal all threads to stop
+        info!("Exit requested...");
         self.cam_stop_signal.store(true, Ordering::Relaxed);
         self.seg_stop_signal.store(true, Ordering::Relaxed);
-        self.audio_capture_stop_signal.store(true, Ordering::Relaxed);
-        self.audio_processor_stop_signal.store(true, Ordering::Relaxed);
+        self.audio_capture_stop_signal
+            .store(true, Ordering::Relaxed);
+        self.audio_processor_stop_signal
+            .store(true, Ordering::Relaxed);
         info!("Stop signals sent.");
-
-        // 2. Stop the audio stream explicitly (important for cpal)
         if let Some(stream) = self.audio_capture_thread_handle.take() {
-            info!("Stopping audio stream...");
-            if let Err(e) = stream.pause() { // Pause instead of drop? Or just let drop handle it? Pause seems safer.
+            if let Err(e) = stream.pause() {
                 error!("Error pausing audio stream: {}", e);
-            } else {
-                info!("Audio stream paused.");
             }
-            drop(stream); // Ensure it's dropped
-             info!("Audio stream dropped.");
-        } else {
-            info!("Audio stream handle already taken or never existed.");
+            drop(stream);
+            info!("Audio stream dropped.");
         }
-
-
-        // 3. Join threads (with timeouts?)
-        if let Some(handle) = self.cam_thread_handle.take() {
-             info!("Joining camera thread...");
-             if let Err(e) = handle.join() { error!("Camera thread join error: {:?}", e); } else { info!("Camera thread joined."); }
+        if let Some(h) = self.cam_thread_handle.take() {
+            info!("Joining cam...");
+            if let Err(e) = h.join() {
+                error!("Cam join err: {:?}", e);
+            }
         }
-        if let Some(handle) = self.audio_processor_thread_handle.take() {
-            info!("Joining audio processor thread...");
-            if let Err(e) = handle.join() { error!("Audio processor thread join error: {:?}", e); } else { info!("Audio processor thread joined."); }
+        if let Some(h) = self.audio_processor_thread_handle.take() {
+            info!("Joining audio proc...");
+            if let Err(e) = h.join() {
+                error!("Audio proc join err: {:?}", e);
+            }
         }
-         if let Some(handle) = self.seg_thread_handle.take() {
-            info!("Joining segmentation thread...");
-            if let Err(e) = handle.join() { error!("Segmentation thread join error: {:?}", e); } else { info!("Segmentation thread joined."); }
+        if let Some(h) = self.seg_thread_handle.take() {
+            info!("Joining seg...");
+            if let Err(e) = h.join() {
+                error!("Seg join err: {:?}", e);
+            }
         }
-
-        info!("All threads stopped and joined.");
+        info!("All threads stopped/joined.");
     }
 }
 
-// Helper for centering content, useful for loading/error states
 trait CenteredJustified {
     fn centered_and_justified(&mut self, add_contents: impl FnOnce(&mut egui::Ui));
 }
-
 impl CenteredJustified for egui::Ui {
     fn centered_and_justified(&mut self, add_contents: impl FnOnce(&mut egui::Ui)) {
         self.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            ui.add_space(ui.available_height() / 3.0); // Adjust vertical spacing
+            ui.add_space(ui.available_height() / 3.0);
             add_contents(ui);
         });
     }

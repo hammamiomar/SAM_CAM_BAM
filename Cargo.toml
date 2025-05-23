@@ -66,6 +66,6 @@ opt-level = 2 # fast and small wasm
 opt-level = 2
 
 [lints.rust]
-
+deprecated_clippy_cfg_attr = "allow"
 
 
